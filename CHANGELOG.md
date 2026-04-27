@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.13.0](https://github.com/stoatchat/stoatchat/compare/v0.12.1...v0.13.0) (2026-04-27)
+
+
+### Features
+
+* automatically sanitise usernames on create/update ([#689](https://github.com/stoatchat/stoatchat/issues/689)) ([e937697](https://github.com/stoatchat/stoatchat/commit/e93769786c7669485a659ee471630740d3cea702))
+
+
+### Bug Fixes
+
+* add new_user_hours to configuration limits ([#729](https://github.com/stoatchat/stoatchat/issues/729)) ([279f5d5](https://github.com/stoatchat/stoatchat/commit/279f5d5fd7af2df55902c706859ec07f569cdb1e))
+* add reconnection policy to Redis subscriber to prevent ghost state ([#708](https://github.com/stoatchat/stoatchat/issues/708)) ([057f2bb](https://github.com/stoatchat/stoatchat/commit/057f2bb8b359f8b942741a30ff54eeb8fbe3e0b1))
+* dont send notification in fcm ([#721](https://github.com/stoatchat/stoatchat/issues/721)) ([89171e9](https://github.com/stoatchat/stoatchat/commit/89171e9bd0f15711157e78c6eec0fe7b480de93a))
+* update message length validation to remove upper limit ([#723](https://github.com/stoatchat/stoatchat/issues/723)) ([ed4fd5e](https://github.com/stoatchat/stoatchat/commit/ed4fd5ebfe6d0ea534a0898da4afdc1f4e2cd6c5))
+
 ## [0.12.1](https://github.com/stoatchat/stoatchat/compare/v0.12.0...v0.12.1) (2026-04-10)
 
 
