@@ -1,7 +1,6 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, num::NonZeroUsize, sync::Arc};
 
 use async_tungstenite::WebSocketStream;
-use authifier::AuthifierEvent;
 use fred::{
     error::RedisErrorKind,
     interfaces::{ClientLike, EventInterface, PubsubInterface},
@@ -13,7 +12,7 @@ use futures::{
     stream::{SplitSink, SplitStream},
     FutureExt, SinkExt, StreamExt, TryStreamExt,
 };
-use redis_kiss::{PayloadType, REDIS_PAYLOAD_TYPE, REDIS_URI};
+use redis_kiss::{get_connection, AsyncCommands, PayloadType, REDIS_PAYLOAD_TYPE, REDIS_URI};
 use revolt_config::report_internal_error;
 use revolt_database::{
     events::{client::EventV1, server::ClientMessage},
@@ -22,19 +21,22 @@ use revolt_database::{
 };
 use revolt_presence::{create_session, delete_session};
 
-use async_std::{
+use revolt_result::create_error;
+use sentry::Level;
+use tokio::{
     net::TcpStream,
     sync::{Mutex, RwLock},
     task::spawn,
 };
-use revolt_result::create_error;
-use sentry::Level;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use crate::config::{ProtocolConfiguration, WebsocketHandshakeCallback};
 use crate::events::state::{State, SubscriptionStateChange};
+use revolt_models::v0;
 
-type WsReader = SplitStream<WebSocketStream<TcpStream>>;
-type WsWriter = SplitSink<WebSocketStream<TcpStream>, async_tungstenite::tungstenite::Message>;
+type WsReader = SplitStream<WebSocketStream<Compat<TcpStream>>>;
+type WsWriter =
+    SplitSink<WebSocketStream<Compat<TcpStream>>, async_tungstenite::tungstenite::Message>;
 
 /// Start a new WebSocket client worker given access to the database,
 /// the relevant TCP stream and the remote address of the client.
@@ -44,7 +46,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
     // e.g. wss://example.com?format=json&version=1
     let (sender, receiver) = oneshot::channel();
     let Ok(ws) = async_tungstenite::accept_hdr_async_with_config(
-        stream,
+        stream.compat(),
         WebsocketHandshakeCallback::from(sender),
         None,
     )
@@ -105,8 +107,15 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
         .await
         .ok();
 
+    let backend_config = revolt_config::config().await;
+
     // Create local state.
-    let mut state = State::from(user, session_id);
+    let mut state = State::from(
+        user,
+        session_id,
+        NonZeroUsize::new(backend_config.features.advanced.seen_events_cache_size as usize)
+            .expect("config.features.advanced.seen_events_cache_size cannot be 0!"),
+    );
     let user_id = state.cache.user_id.clone();
 
     // Notify socket we have authenticated.
@@ -126,6 +135,14 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
 
     if report_internal_error!(write.send(config.encode(&ready_payload)).await).is_err() {
         return;
+    }
+
+    let slowmodes = fetch_user_slowmodes(&user_id).await.unwrap_or_default();
+    if !slowmodes.is_empty() {
+        let event = EventV1::UserSlowmodes { slowmodes };
+        if report_internal_error!(write.send(config.encode(&event)).await).is_err() {
+            return;
+        }
     }
 
     // Create presence session.
@@ -172,6 +189,7 @@ pub async fn client(db: &'static Database, stream: TcpStream, addr: SocketAddr) 
             read,
             &write,
             kill_signal_1_s,
+            db,
         );
 
         join!(listener, worker);
@@ -346,22 +364,20 @@ async fn listener(
                     break 'out;
                 };
 
-                if let EventV1::Auth(auth) = &event {
-                    if let AuthifierEvent::DeleteSession { session_id, .. } = auth {
-                        if &state.session_id == session_id {
+                if let EventV1::DeleteSession { session_id, .. } = &event {
+                    if &state.session_id == session_id {
+                        event = EventV1::Logout;
+                    }
+                } else if let EventV1::DeleteAllSessions {
+                    exclude_session_id, ..
+                } = &event
+                {
+                    if let Some(excluded) = exclude_session_id {
+                        if &state.session_id != excluded {
                             event = EventV1::Logout;
                         }
-                    } else if let AuthifierEvent::DeleteAllSessions {
-                        exclude_session_id, ..
-                    } = auth
-                    {
-                        if let Some(excluded) = exclude_session_id {
-                            if &state.session_id != excluded {
-                                event = EventV1::Logout;
-                            }
-                        } else {
-                            event = EventV1::Logout;
-                        }
+                    } else {
+                        event = EventV1::Logout;
                     }
                 } else {
                     let should_send = state.handle_incoming_event_v1(db, &mut event).await;
@@ -405,6 +421,7 @@ async fn worker_with_kill_signal(
     read: WsReader,
     write: &Mutex<WsWriter>,
     kill_signal_s: async_channel::Sender<()>,
+    db: &Database,
 ) {
     worker(
         addr,
@@ -416,6 +433,7 @@ async fn worker_with_kill_signal(
         kill_signal_r,
         read,
         write,
+        db,
     )
     .await;
     kill_signal_s.send(()).await.ok();
@@ -432,9 +450,8 @@ async fn worker(
     kill_signal_r: async_channel::Receiver<()>,
     mut read: WsReader,
     write: &Mutex<WsWriter>,
+    db: &Database,
 ) {
-    let revolt_config = revolt_config::config().await;
-
     loop {
         let t1 = read.try_next().fuse();
         let t2 = kill_signal_r.recv().fuse();
@@ -471,10 +488,6 @@ async fn worker(
 
                 match payload {
                     ClientMessage::BeginTyping { channel } => {
-                        if revolt_config.disable_events_dont_use {
-                            continue;
-                        }
-
                         if !subscribed.read().await.contains(&channel) {
                             continue;
                         }
@@ -487,10 +500,6 @@ async fn worker(
                         .await;
                     }
                     ClientMessage::EndTyping { channel } => {
-                        if revolt_config.disable_events_dont_use {
-                            continue;
-                        }
-
                         if !subscribed.read().await.contains(&channel) {
                             continue;
                         }
@@ -503,13 +512,15 @@ async fn worker(
                         .await;
                     }
                     ClientMessage::Subscribe { server_id } => {
-                        let mut servers = active_servers.lock().await;
-                        let has_item = servers.contains_key(&server_id);
-                        servers.insert(server_id, ());
+                        if db.fetch_member(&server_id, &user_id).await.is_ok() {
+                            let mut servers = active_servers.lock().await;
+                            let has_item = servers.contains_key(&server_id);
+                            servers.insert(server_id, ());
 
-                        if !has_item {
-                            // Poke the listener to adjust subscriptions
-                            topic_signal_s.send(()).await.ok();
+                            if !has_item {
+                                // Poke the listener to adjust subscriptions
+                                topic_signal_s.send(()).await.ok();
+                            }
                         }
                     }
                     ClientMessage::Ping { data, responded } => {
@@ -527,4 +538,43 @@ async fn worker(
             }
         }
     }
+}
+
+async fn fetch_user_slowmodes(user_id: &str) -> Option<Vec<v0::ChannelSlowmode>> {
+    let mut conn = get_connection().await.ok()?.into_inner();
+    let idx_key = format!("slowmode_idx:{}", user_id);
+
+    let channel_ids: Vec<String> = conn.smembers(&idx_key).await.unwrap_or_default();
+    if channel_ids.is_empty() {
+        return Some(vec![]);
+    }
+
+    // Bulk fetch all TTLs in one round trip
+    let mut pipe = redis_kiss::redis::pipe();
+    for channel_id in &channel_ids {
+        pipe.ttl(format!("slowmode:{}:{}", user_id, channel_id));
+    }
+    let ttls: Vec<i64> = pipe.query_async(&mut conn).await.unwrap_or_default();
+
+    // Partition into alive/expired in one pass
+    let mut slowmodes = vec![];
+    let mut expired = vec![];
+    for (channel_id, ttl) in channel_ids.iter().zip(ttls.iter()) {
+        if *ttl > 0 {
+            slowmodes.push(v0::ChannelSlowmode {
+                channel_id: channel_id.clone(),
+                duration: *ttl as u64,
+                retry_after: *ttl as u64,
+            });
+        } else {
+            expired.push(channel_id.as_str());
+        }
+    }
+
+    // Bulk remove all expired members in one SREM call
+    if !expired.is_empty() {
+        conn.srem::<_, _, ()>(&idx_key, expired).await.ok();
+    }
+
+    Some(slowmodes)
 }

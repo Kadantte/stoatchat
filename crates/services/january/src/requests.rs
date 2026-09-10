@@ -4,6 +4,7 @@ use mime::Mime;
 use pdk_ip_filter_lib::IpFilter;
 use regex::Regex;
 use reqwest::{
+    dns::{Addrs, Name, Resolve},
     header::{self, CONTENT_TYPE},
     redirect, Client, Response,
 };
@@ -11,6 +12,7 @@ use revolt_config::{config, report_internal_error};
 use revolt_files::{create_thumbnail, decode_image, image_size_vec, is_valid_image, video_size};
 use revolt_models::v0::{Embed, Image, ImageSize, Video};
 use revolt_result::{create_error, Error, Result, ToRevoltError};
+use std::net::{IpAddr, SocketAddr};
 use std::{
     io::{Cursor, Write},
     str::FromStr,
@@ -18,9 +20,12 @@ use std::{
 };
 use url::{Host, Url};
 
+use crate::specialty;
+
 lazy_static! {
     /// Request client
     static ref CLIENT: Client = reqwest::Client::builder()
+        .dns_resolver(CachedDnsResolver {})
         .timeout(Duration::from_secs(10)) // TODO config
         .connect_timeout(Duration::from_secs(5)) // TODO config
         .redirect(redirect::Policy::none())
@@ -28,13 +33,19 @@ lazy_static! {
         .expect("reqwest Client");
 
     /// Spoof User Agent as Discord
-    static ref RE_USER_AGENT_SPOOFING_AS_DISCORD: Regex = Regex::new("^(?:(?:vx|fx)?twitter|(?:fixv|fixup)?x|(?:old\\.|new\\.|www\\.)reddit).com").expect("valid regex");
+    static ref RE_USER_AGENT_SPOOFING_AS_DISCORD: Regex = Regex::new("^(?:(?:vx|fx)?twitter|(?:fixv|fixup)?x|(?:old\\.|new\\.|www\\.)reddit)\\.com|klipy\\.com").expect("valid regex");
 
     /// Regex for matching new Reddit URLs
     static ref RE_URL_NEW_REDDIT: Regex = Regex::new("^(?:(?:new\\.|www\\.)?reddit).com").expect("valid regex");
 
     /// Regex for matching YouTube Shorts URLs
-    static ref RE_URL_YOUTUBE_SHORTS: Regex = Regex::new("^(?:(?:https?:)?//)?(?:(?:www\\.)?youtube\\.com)/shorts/([a-zA-Z0-9_-]+)").expect("valid regex");
+    pub static ref RE_URL_YOUTUBE_SHORTS: Regex = Regex::new("^(?:(?:https?:)?//)?(?:(?:www\\.)?youtube\\.com)/shorts/([a-zA-Z0-9_-]+)").expect("valid regex");
+
+    /// Regex for matching YouTube URLs
+    pub static ref RE_URL_YOUTUBE: Regex = Regex::new("^(?:(?:https?:)?//)?(?:(?:www|m)\\.)?(?:(?:youtube\\.com|youtu\\.be))(?:/(?:[\\w\\-]+\\?v=|embed/|v/|shorts/)?)([\\w\\-]+)(?:(?:&t|&start)=([\\d]+))?(?:\\S+)?$").unwrap();
+
+    /// Url for YouTube oembed
+    pub static ref OEMBED_URL: Url = Url::parse("https://www.youtube.com/oembed").unwrap();
 
     /// Cache for proxy results
     static ref PROXY_CACHE: moka::future::Cache<String, Result<(String, Vec<u8>)>> = moka::future::Cache::builder()
@@ -58,22 +69,79 @@ lazy_static! {
         .time_to_live(Duration::from_secs(60)) // For up to 1 minute
         .build();
 
+    static ref DNS_CACHE: moka::future::Cache<String, Vec<SocketAddr>> = moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_idle(Duration::from_secs(30))
+        .build();
+
     static ref IP_BLOCKLIST: IpFilter = IpFilter::block(&[
+        "0.0.0.0/8",
         "10.0.0.0/8",
         "192.168.0.0/16",
         "127.0.0.0/8",
         "172.16.0.0/12",
         "169.254.0.0/16",
         "::1",
-        "fc00::/7"
+        "::",
+        "fc00::/7",
+        "fc00::/10"
         ]
     ).unwrap();
 }
 
+#[derive(Clone)]
+pub struct IPRequest {
+    url: Url,
+    ip: IpAddr,
+    pub blocked: bool,
+}
+
+impl From<IPRequest> for Url {
+    fn from(value: IPRequest) -> Self {
+        let mut url = value.url.clone();
+        url.set_host(Some(&value.ip.to_string()))
+            .map(|_| url)
+            .unwrap_or(value.url)
+    }
+}
+
+struct CachedDnsResolver {}
+
+impl reqwest::dns::Resolve for CachedDnsResolver {
+    fn resolve(&self, name: Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            {
+                if let Some(addrs) = DNS_CACHE.get(&name.as_str().to_string()).await {
+                    let resp: Addrs = Box::new(addrs.clone().into_iter());
+                    return Ok(resp);
+                }
+            }
+
+            let mut lookup = name.as_str().to_string();
+            if !lookup.contains(":") {
+                lookup += ":0";
+            }
+
+            let fallback: Vec<SocketAddr> = tokio::net::lookup_host(&lookup)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+
+            {
+                DNS_CACHE
+                    .insert(name.as_str().to_string().clone(), fallback.clone())
+                    .await;
+                let addrs: Addrs = Box::new(fallback.clone().into_iter());
+                Ok(addrs)
+            }
+        })
+    }
+}
+
 /// Information about a successful request
 pub struct Request {
-    response: Response,
-    mime: Mime,
+    pub response: Response,
+    pub mime: Mime,
 }
 
 impl Request {
@@ -134,6 +202,7 @@ impl Request {
     pub async fn fetch_image_metadata(
         url: &str,
         request: Option<Request>,
+        size: ImageSize,
     ) -> Result<Option<Image>> {
         if let Some(hit) = EMBED_CACHE.get(url).await {
             match hit {
@@ -160,7 +229,7 @@ impl Request {
                     url: url.to_owned(),
                     width,
                     height,
-                    size: ImageSize::Large,
+                    size,
                 }))
             } else {
                 Ok(None)
@@ -227,6 +296,16 @@ impl Request {
         // Generate the actual embed
         if let Some(hit) = EMBED_CACHE.get(&url).await {
             Ok(hit)
+        } else if RE_URL_YOUTUBE.is_match(&url) {
+            let mut yt_url = OEMBED_URL.clone();
+            yt_url.set_query(Some(&format!("url={url}")));
+
+            let request = Request::new(yt_url).await?;
+            let embed = specialty::SpecialtySitesGenerator::youtube(&url, request).await?;
+
+            EMBED_CACHE.insert(url.to_owned(), embed.clone()).await;
+
+            Ok(embed)
         } else {
             let request = Request::new_from_str(&url).await?;
             let embed = match (request.mime.type_(), request.mime.subtype()) {
@@ -254,10 +333,12 @@ impl Request {
                         .map(Embed::Website)
                         .unwrap_or_default()
                 }
-                (mime::IMAGE, _) => Request::fetch_image_metadata(&url, Some(request))
-                    .await
-                    .map(|res| res.map(Embed::Image).unwrap_or_default())
-                    .unwrap_or_default(),
+                (mime::IMAGE, _) => {
+                    Request::fetch_image_metadata(&url, Some(request), ImageSize::Large)
+                        .await
+                        .map(|res| res.map(Embed::Image).unwrap_or_default())
+                        .unwrap_or_default()
+                }
                 (mime::VIDEO, _) => Request::fetch_video_metadata(&url, Some(request))
                     .await
                     .map(|res| res.map(Embed::Video).unwrap_or_default())
@@ -275,7 +356,12 @@ impl Request {
         let mut url = url;
         let url_host_str = url.host_str().ok_or(create_error!(ProxyError))?.to_string();
 
-        Request::url_is_blacklisted(&url).await?;
+        let mut blocker = Request::url_is_blacklisted(&url).await?;
+
+        if blocker.blocked {
+            return Err(create_error!(InvalidOperation));
+        }
+
         let mut redirect_count = 0;
 
         loop {
@@ -304,9 +390,13 @@ impl Request {
                     let location = location.to_str().map_err(|_| create_error!(ProxyError))?;
                     url = Url::from_str(location).to_internal_error()?;
 
-                    if !Request::url_is_blacklisted(&url).await? {
-                        continue;
+                    blocker = Request::url_is_blacklisted(&url).await?;
+
+                    if blocker.blocked {
+                        return Err(create_error!(InvalidOperation));
                     }
+
+                    continue;
                 } else {
                     return Err(create_error!(ProxyError));
                 }
@@ -351,17 +441,26 @@ impl Request {
         Ok(Request::exists(proper_url).await)
     }
 
-    pub async fn url_is_blacklisted(url: &Url) -> Result<bool> {
+    pub async fn url_is_blacklisted(url: &Url) -> Result<IPRequest> {
+        let mut resolved_address: Option<IpAddr> = None;
+
         if let Some(host) = url.host() {
             match host {
                 Host::Ipv4(ipv4) => {
-                    let url_str = ipv4.to_string();
-                    if !IP_BLOCKLIST.is_allowed(&url_str) {
+                    if !IP_BLOCKLIST.is_allowed(&ipv4.to_string()) {
                         return Err(create_error!(InvalidOperation));
                     }
+                    resolved_address = Some(ipv4.into());
+                }
+                Host::Ipv6(ipv6) => {
+                    let string = ipv6.to_string();
+                    if string.contains("::ffff:") || !IP_BLOCKLIST.is_allowed(&string) {
+                        return Err(create_error!(InvalidOperation));
+                    }
+                    resolved_address = Some(ipv6.into());
                 }
                 Host::Domain(domain) => {
-                    let mut domain = domain.to_string();
+                    let domain = domain.to_string();
 
                     let config = config().await;
 
@@ -372,27 +471,42 @@ impl Request {
                         return Err(create_error!(InvalidOperation));
                     }
 
-                    if !domain.contains(":") {
-                        domain += ":80";
-                    }
-
                     // Second step: resolve the IP and check the blocklist
-                    if let Ok(mut resolved_ip) = tokio::net::lookup_host(domain.clone()).await {
-                        if let Some(resolved_ip) = resolved_ip.next() {
-                            if !IP_BLOCKLIST.is_allowed(&resolved_ip.ip().to_string()) {
+                    let resolver = CachedDnsResolver {};
+                    if let Ok(resolved_ips) = resolver
+                        .resolve(
+                            Name::from_str(&domain)
+                                .map_err(|_| create_error!(ProxyError))
+                                .unwrap(),
+                        )
+                        .await
+                    {
+                        for resolved in resolved_ips {
+                            resolved_address = Some(resolved.ip()); // last resolved ip will be the one we hit as a consequence of this for loop.
+                            let resolved_string = resolved_address.unwrap().to_string();
+                            if !IP_BLOCKLIST.is_allowed(&resolved_string)
+                                || resolved_string.contains("::ffff:")
+                            {
                                 return Err(create_error!(InvalidOperation));
                             }
-                        } else {
-                            return Err(create_error!(InvalidOperation));
                         }
                     } else {
                         return Err(create_error!(ProxyError));
                     }
                 }
-                _ => (),
             }
+        } else {
+            return Err(create_error!(ProxyError));
         };
 
-        Ok(false)
+        if resolved_address.is_none() {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        Ok(IPRequest {
+            url: url.clone(),
+            ip: resolved_address.unwrap(),
+            blocked: false,
+        })
     }
 }
